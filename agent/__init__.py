@@ -21,6 +21,14 @@ from agent.orchestrator import (
     StepCall,
 )
 
+from agent.briefing_sections import (
+    BriefingSection,
+    SECTION_REGISTRY,
+    run_spice_section,
+    run_daily_spice_sections,
+    get_daily_spice_sections,
+)
+
 __all__ = [
     "AgentContext",
     "ExecutionPlan",
@@ -35,4 +43,9 @@ __all__ = [
     "PlanExecutor",
     "PlanCollisionError",
     "StepCall",
+    "BriefingSection",
+    "SECTION_REGISTRY",
+    "run_spice_section",
+    "run_daily_spice_sections",
+    "get_daily_spice_sections",
 ]

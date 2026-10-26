@@ -1,3 +1,11 @@
+import sys
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ProAssist.AGENT001.1")
+    except Exception:
+        pass
+
 import platform as _platform
 import subprocess as _subprocess
 
@@ -63,7 +71,7 @@ from memory.memory_manager import (
 # imported or declared here — they self-describe via a TOOL dict in their own
 # actions/*.py file and are auto-discovered by core.action_loader at startup.
 # Only tools that are tied to live-session state stay inline in this file
-# (screen_process, close_camera, save_memory, manage_monitor, shutdown_jarvis,
+# (screen_process, close_camera, save_memory, manage_monitor, shutdown_agent,
 # system_status).
 from actions.screen_processor  import _capture_camera, _capture_screen
 from actions.system_monitor    import SystemMonitor, get_system_status
@@ -93,6 +101,7 @@ from agent.planner             import (
     create_plan, ExecutionPlan, PlanState, StepStatus,
     PlanSecurityRejection, PlanValidationError,
 )
+from agent.briefing_sections   import run_daily_spice_sections, BriefingSection
 
 
 class TextCommandCall:
@@ -431,7 +440,7 @@ TOOL_DECLARATIONS = [
         },
     },
     {
-        "name": "shutdown_jarvis",
+        "name": "shutdown_agent",
         "description": (
             "Shuts down the assistant completely. "
             "Call this when the user expresses intent to end the conversation, "
@@ -707,6 +716,7 @@ class AgentLive:
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
+        self.ui.on_api_key_change = self._on_api_key_change
         if hasattr(self.ui, "_win") and hasattr(self.ui._win, "_mute_sig"):
             try:
                 self.ui._win._mute_sig.connect(self._on_desktop_mute_changed)
@@ -737,8 +747,9 @@ class AgentLive:
         # "yesterday we talked about…" line silently disappears.
         self._resume_handle: str | None = None
         self._turn_done_event: asyncio.Event | None = None
+        self._playback_done_event: asyncio.Event | None = None
         self._dashboard     = None
-        self._briefing_sent    = False          # morning briefing fires once per process
+        self._briefing_sent    = False          # morning briefing fires once per authenticated session
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
@@ -817,6 +828,9 @@ class AgentLive:
         self.ui.on_voice_auth_enroll = self._ui_voice_auth_enroll
         AgentContext.get_instance().set_ui(self.ui)
         self._plan_executor = PlanExecutor(agent=self)
+        self._shutting_down = False
+        if hasattr(self.ui, "on_close_requested"):
+            self.ui.on_close_requested = self._on_ui_close_requested
 
     # ── Wake word: state machine ─────────────────────────────────────────────
 
@@ -889,16 +903,57 @@ class AgentLive:
             self._authorized_user = name
             self.wake(reason=f"voice verified — welcome back, {name}")
             self.ui.write_log(f"AUTH: Verified {name} ({score:.0%} voice match).")
-            # The model receives the name only after local authentication.
-            self._on_text_command(
-                f"Voice authentication succeeded. The identified user is {name}. "
-                f"Greet {name} by name and wait for their request."
-            )
+            # Reset briefing flag for this newly authenticated session
+            self._briefing_sent = False
+            loop = getattr(self, "loop", None) or getattr(self, "_loop", None)
+            if loop and loop.is_running():
+                asyncio.run_coroutine_threadsafe(
+                    self._on_auth_success_flow(name),
+                    loop
+                )
         else:
             self.ui.write_log("AUTH: User not identified; access denied.")
             self.ui.write_log(
                 f"AUTH: Voice match score {score:.0%}. The assistant remains asleep."
             )
+
+    async def _on_auth_success_flow(self, name: str) -> None:
+        """
+        Auth-success flow:
+        1. Speak "I'm ready, Boss".
+        2. Await audio playback to finish (turn_complete + audio queue drained, with a 5s fallback timeout).
+        3. If morning briefing is enabled, start the briefing as an asyncio task.
+        """
+        if not self.session:
+            return
+
+        # 1. Speak "I'm ready, Boss"
+        if self._playback_done_event:
+            self._playback_done_event.clear()
+        if self._turn_done_event:
+            self._turn_done_event.clear()
+
+        try:
+            await self.session.send_client_content(
+                turns={"role": "user", "parts": [{"text": "Say exactly this one sentence and nothing else: I'm ready, Boss."}]},
+                turn_complete=True,
+            )
+        except Exception as e:
+            print(f"[AUTH] Failed to send ready phrase: {e}")
+
+        # 2. Await playback to finish with a 5-second fallback timeout
+        if self._playback_done_event:
+            try:
+                await asyncio.wait_for(self._playback_done_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(1.5)
+
+        # 3. If morning briefing is enabled, trigger briefing
+        if get_brief_enabled() and not self._briefing_sent:
+            self._briefing_sent = True
+            asyncio.create_task(self._send_startup_briefing(user_name=name))
 
     def _end_authorized_session(self, reason: str = "user ended the session") -> None:
         """Lock the assistant until the enrolled user authenticates again."""
@@ -910,6 +965,127 @@ class AgentLive:
             self._auth_verifying = False
         self.sleep(reason=reason)
         self.ui.write_log("AUTH: Session ended. Say 'Agent' and authenticate to continue.")
+
+    def _on_ui_close_requested(self) -> None:
+        self.request_shutdown_threadsafe(reason="UI close button", from_voice=False)
+
+    def request_shutdown_threadsafe(self, reason: str = "user request", from_voice: bool = False) -> None:
+        loop = getattr(self, "loop", None) or getattr(self, "_loop", None)
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(
+                self.request_shutdown(reason=reason, from_voice=from_voice),
+                loop,
+            )
+        else:
+            from PyQt6.QtWidgets import QApplication
+            app = QApplication.instance()
+            if app:
+                app.quit()
+
+    async def _wait_farewell_playback(self, from_voice: bool) -> None:
+        if from_voice:
+            # 1. Wait for Gemini Live model to send turn_complete for the farewell turn
+            if self._turn_done_event:
+                try:
+                    await asyncio.wait_for(self._turn_done_event.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    print("[AGENT] Timeout waiting for farewell turn_complete")
+        print("[AGENT] farewell_turn_complete")
+
+        # 2. Wait until audio_in_queue is empty and playback is done
+        while not self.audio_in_queue.empty():
+            await asyncio.sleep(0.04)
+
+        if self._playback_done_event and getattr(self, "_is_speaking", False):
+            try:
+                await asyncio.wait_for(self._playback_done_event.wait(), timeout=4.0)
+            except asyncio.TimeoutError:
+                print("[AGENT] Timeout waiting for audio playback to finish")
+
+        # Wait for mobile playback end if active
+        now_m = time.monotonic()
+        if hasattr(self, "_phone_play_end") and self._phone_play_end > now_m:
+            phone_wait = min(self._phone_play_end - now_m + 0.15, 4.0)
+            await asyncio.sleep(phone_wait)
+
+        print("[AGENT] audio_queue_drained")
+
+        # 3. Hardware output latency buffer (+ 0.35s margin) so speakers play out the buffer
+        latency = getattr(self, "_out_latency", 0.20)
+        await asyncio.sleep(max(latency + 0.35, 0.40))
+        self.set_speaking(False)
+        print("[AGENT] output_stream_stopped")
+
+    async def request_shutdown(self, reason: str = "user request", from_voice: bool = False) -> None:
+        """
+        Single idempotent graceful shutdown path:
+        1. Mark state SHUTTING_DOWN. Stop accepting new user audio and tool calls.
+        2. If from_voice: wait for farewell Live turn complete, audio queue drained, output stream stopped.
+        3. Hard timeout (6-8s) ensures exit never hangs.
+        4. Flush mobile audio, close sessions, stop wake-word, save memory, close UI, app quit.
+        """
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+
+        print("[AGENT] exit_requested")
+        self.ui.write_log(f"SYS: Shutdown initiated ({reason}).")
+        self.ui.set_state("SHUTTING_DOWN")
+
+        # Wait for farewell playback with 7.0s hard timeout
+        try:
+            await asyncio.wait_for(self._wait_farewell_playback(from_voice), timeout=7.0)
+        except asyncio.TimeoutError:
+            print("[AGENT] Shutdown playback wait timed out after 7s — proceeding with shutdown.")
+            self.ui.write_log("SYS: Shutdown playback wait timed out — proceeding with shutdown.")
+            self.set_speaking(False)
+            print("[AGENT] farewell_turn_complete")
+            print("[AGENT] audio_queue_drained")
+            print("[AGENT] output_stream_stopped")
+
+        # Close sessions / wake word
+        if getattr(self, "_wake_detector", None):
+            try:
+                self._wake_detector.stop()
+            except Exception:
+                pass
+
+        if self._dashboard:
+            try:
+                await self._dashboard.broadcast({"type": "status", "state": "offline"})
+            except Exception:
+                pass
+
+        print("[AGENT] sessions_closed")
+
+        # Save session memory summary
+        try:
+            await asyncio.wait_for(self._save_session_summary(), timeout=4.0)
+        except Exception as e:
+            print(f"[AGENT] Session summary save during shutdown error: {e}")
+
+        print("[AGENT] memory_saved")
+
+        try:
+            ActionLogger.log_event(
+                tool="shutdown_agent",
+                action="shutdown",
+                result="Graceful shutdown completed cleanly",
+                verified=True,
+            )
+        except Exception:
+            pass
+
+        print("[AGENT] app_quit")
+        from PyQt6.QtCore import QTimer
+        from PyQt6.QtWidgets import QApplication
+        app = QApplication.instance()
+        if app:
+            if hasattr(self.ui, "_win") and self.ui._win:
+                self.ui._win.on_close_requested = None
+                QTimer.singleShot(0, self.ui._win.close)
+            QTimer.singleShot(50, app.quit)
+
 
     def _verify_wake_voice(self, samples: np.ndarray) -> None:
         try:
@@ -1095,6 +1271,11 @@ class AgentLive:
         landed before this feature did."""
         self.request_reconnect(keep_context=True, reason="audio device")
 
+    def _on_api_key_change(self):
+        """Gemini API key changed in UI Settings. Rebuild session with the new key."""
+        self.ui.write_log("SYS: New Gemini API key applied — reconnecting...")
+        self.request_reconnect(keep_context=False, reason="new API key")
+
     async def _watch_reconnect(self):
         """Session-scoped task: when a voluntary reconnect is requested, raise a
         signal that unwinds the TaskGroup so the run loop rebuilds the session."""
@@ -1211,11 +1392,15 @@ class AgentLive:
             self._is_speaking = value
         if value:
             self._tail_until = 0.0
+            if getattr(self, "_playback_done_event", None):
+                self._playback_done_event.clear()
         else:
             # Hold the guard open across the device's own output latency plus a
             # cooldown margin to absorb trailing TTS echo and application sounds.
             self._tail_until = time.monotonic() + max(self._out_latency + _TAIL_MARGIN, 0.40)
             self._phone_tail_holdoff_until = max(time.monotonic(), self._phone_play_end) + PHONE_MIC_TAIL_HOLDOFF
+            if getattr(self, "_playback_done_event", None):
+                self._playback_done_event.set()
         if not value:
             # The echo history is deliberately NOT cleared here: the tail above
             # still needs it to recognise our own voice. It is dropped when the
@@ -1225,6 +1410,8 @@ class AgentLive:
             self.ui.set_state("SPEAKING")
         elif self._phone_active:
             self.ui.set_state("LISTENING")
+        elif not self._awake:
+            self.ui.set_state("SLEEPING")
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
 
@@ -1329,6 +1516,8 @@ class AgentLive:
         self.set_speaking(False)
         # The words we were about to mouth are never going to be spoken now.
         self._visemes.reset()
+        if hasattr(self.ui, "reset_visemes"):
+            self.ui.reset_visemes()
         self._play_cursor = 0.0     # next batch starts a fresh timeline
         if self._turn_done_event:
             self._turn_done_event.clear()
@@ -1338,7 +1527,13 @@ class AgentLive:
             self.ui.write_log("SYS: Interrupted — listening...")
 
     def speak(self, text: str):
-        if not self._loop or not self.session:
+        loop = getattr(self, "_loop", None) or getattr(self, "loop", None)
+        if not loop:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+        if not loop or not self.session:
             return
         self._clear_interrupted()
         asyncio.run_coroutine_threadsafe(
@@ -1346,7 +1541,7 @@ class AgentLive:
                 turns={"role": "user", "parts": [{"text": text}]},
                 turn_complete=True
             ),
-            self._loop
+            loop
         )
 
     def speak_error(self, tool_name: str, error: str):
@@ -1539,7 +1734,17 @@ class AgentLive:
                     print(f"[PlanExecutor] 🛡️ Blocked conflicting live tool call: {name}.{_act or 'default'} ({perm.level.value})")
                     return types.FunctionResponse(id=fc.id, name=name, response={"result": msg})
 
+        name = fc.name
+        args = dict(fc.args) if fc.args else {}
         print(f"[AGENT] 🔧 {name}  {args}")
+
+        if getattr(self, "_shutting_down", False) and name != "shutdown_agent":
+            return types.FunctionResponse(
+                id=fc.id,
+                name=name,
+                response={"result": "Assistant is shutting down. No new tool executions permitted."}
+            )
+
         self.ui.set_state("THINKING")
 
         loop   = asyncio.get_event_loop()
@@ -1726,22 +1931,17 @@ class AgentLive:
                 else:
                     result = "Specify action (add/remove/list) and a topic."
 
-            elif name == "shutdown_jarvis":
-                self.ui.write_log("SYS: Shutdown requested.")
-                async def _do_shutdown():
-                    await self._save_session_summary()
-                    if self.session:
-                        try:
-                            await self.session.send_client_content(
-                                turns={"role": "user", "parts": [{"text": "Say a brief natural goodbye to the user."}]},
-                                turn_complete=True,
-                            )
-                        except Exception:
-                            pass
-                    await asyncio.sleep(1.5)
-                    import os as _os
-                    _os._exit(0)
-                asyncio.create_task(_do_shutdown())
+            elif name == "shutdown_agent":
+                self.ui.write_log("SYS: Shutdown requested via voice.")
+                result = (
+                    "The user has requested to shut down the assistant. "
+                    "Say a brief, warm goodbye in one short sentence. Do not call any further tools."
+                )
+                if self._turn_done_event:
+                    self._turn_done_event.clear()
+                if self._playback_done_event:
+                    self._playback_done_event.clear()
+                asyncio.create_task(self.request_shutdown(reason="voice command", from_voice=True))
 
             elif self._action_registry.has(name):
                 # file_processor: fall back to the currently-uploaded file when none is given
@@ -1879,6 +2079,8 @@ class AgentLive:
         loop = asyncio.get_event_loop()
 
         def callback(indata, frames, time_info, status):
+            if getattr(self, "_shutting_down", False):
+                return
             # Enrollment consumes the existing live stream. Do this before
             # wake-word/Gemini routing so enrollment audio never leaks to either.
             with self._auth_lock:
@@ -2160,6 +2362,8 @@ class AgentLive:
                                 in_buf  = []
                                 out_buf = []
                                 self._visemes.reset()
+                                if hasattr(self.ui, "reset_visemes"):
+                                    self.ui.reset_visemes()
                                 continue
 
                             full_in = " ".join(in_buf).strip()
@@ -2231,6 +2435,8 @@ class AgentLive:
                             print(f"[AGENT] 📞 {fc.name}")
                             fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
+                        if self._turn_done_event:
+                            self._turn_done_event.clear()
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )
@@ -2304,6 +2510,8 @@ class AgentLive:
                     ):
                         self.set_speaking(False)
                         self._turn_done_event.clear()
+                        if getattr(self, "_playback_done_event", None):
+                            self._playback_done_event.set()
                     continue
 
                 if not getattr(self, "_is_speaking", False):
@@ -2450,15 +2658,19 @@ class AgentLive:
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
-    async def _send_startup_briefing(self) -> None:
+    async def _send_startup_briefing(self, user_name: str = "") -> None:
         """
-        Two-phase briefing optimized for speed:
-          Phase 1 — instant greeting (no tools) → speech starts in <1s
-          Phase 2 — news pre-fetched in a background thread while Phase 1 plays,
-                    delivered as ready text (no Gemini tool-call round-trip) and
-                    shown on the UI content panel. Waits for turn_complete event
-                    instead of a fixed sleep so there is no unnecessary gap.
+        Morning briefing executed once per authenticated session:
+          1. Greet the user warmly and state current time.
+          2. Retrieve the last session summary from memory/long_term.json via pop_last_session().
+          3. Fetch top world news asynchronously (wrapped in asyncio.to_thread with 8s timeout).
+          4. Display headlines in the UI dynamic content panel via thread-safe Qt signal.
+          5. Deliver a single cohesive turn to Gemini Live session.
+          6. Log any failures to logs/agent_actions.jsonl.
         """
+        if not self.session:
+            return
+
         memory   = load_memory()
         identity = memory.get("identity", {})
 
@@ -2467,122 +2679,172 @@ class AgentLive:
             return (e.get("value", "") if isinstance(e, dict) else str(e)).strip()
 
         lang = _val("language")
-        name = _val("name")
+        name = user_name.strip() or _val("name")
         time_str = datetime.now().strftime("%H:%M")
 
-        # Start fetching news immediately — runs in parallel while phase 1 plays
-        loop = asyncio.get_event_loop()
-        news_future = loop.run_in_executor(None, _fetch_news_sync, "top world news today")
-
-        await asyncio.sleep(0.3)
-        if not self.session:
-            return
-
-        # ── Phase 1: instant greeting ─────────────────────────────────────────
-        # The briefing fires before the user has said anything, so the
-        # remembered language is the only signal there is. It is a starting
-        # point, not a setting: the moment they reply, their language wins.
-        lang_clause = (f" Speak this greeting in {lang}, then follow the "
-                       f"user's own language from their first reply onward."
-                       if lang else "")
+        lang_clause = (
+            f" Speak this greeting in {lang}, then follow the user's own language from their first reply onward."
+            if lang else ""
+        )
         name_clause = f" Address the user as {name}." if name else ""
 
-        # Inject last session context if available — pop removes it so it's never repeated
-        last = await asyncio.to_thread(pop_last_session)
-        session_clause = ""
-        if last:
+        # Last session context from memory/long_term.json
+        last = None
+        try:
+            last = await asyncio.to_thread(pop_last_session)
+        except Exception as e:
+            print(f"[AGENT] Error reading last session from memory: {e}")
             try:
-                _delta = (datetime.now() - datetime.strptime(last["date"], "%Y-%m-%d")).days
+                ActionLogger.log_event(
+                    tool="morning_briefing",
+                    action="read_memory",
+                    error=str(e),
+                    verified=False,
+                )
+            except Exception:
+                pass
+
+        session_clause = ""
+        if last and isinstance(last, dict) and "summary" in last:
+            try:
+                _delta = (datetime.now() - datetime.strptime(last.get("date", ""), "%Y-%m-%d")).days
                 _when  = "earlier today" if _delta == 0 else ("yesterday" if _delta == 1 else f"{_delta} days ago")
             except Exception:
                 _when = "last time"
-            session_clause = (
-                f" Also briefly and naturally mention that {_when}: {last['summary']}"
+            session_clause = f" Also briefly and naturally mention that {_when}: {last['summary']}."
+
+        # Fetch news asynchronously without blocking audio or UI
+        news_text = ""
+        news_failed = False
+        try:
+            news_text = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_news_sync, "top world news today"),
+                timeout=8.0,
+            )
+            if (not news_text) or news_text.startswith(
+                ("No news found", "Search failed", "Please provide")
+            ):
+                news_failed = True
+                try:
+                    ActionLogger.log_event(
+                        tool="morning_briefing",
+                        action="fetch_news",
+                        error=f"News unavailable: {news_text[:120] if news_text else 'Empty response'}",
+                        verified=False,
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            news_failed = True
+            try:
+                ActionLogger.log_event(
+                    tool="morning_briefing",
+                    action="fetch_news",
+                    error=str(e),
+                    verified=False,
+                )
+            except Exception:
+                pass
+
+        # Check reminders for today
+        reminder_clause = ""
+        try:
+            from actions.reminder import _load_reminders
+            rems = await asyncio.to_thread(_load_reminders)
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            today_rems = [
+                r for r in rems
+                if r.get("status") == "pending" and str(r.get("target_time", "")).startswith(today_str)
+            ]
+            if today_rems:
+                first_rem = today_rems[0]
+                reminder_clause = f" Mention their reminder scheduled for {first_rem.get('target_time_friendly') or 'today'}: '{first_rem.get('message', '')}'."
+        except Exception as e:
+            print(f"[Briefing] Error reading reminders: {e}")
+
+        # Gather dynamic spice sections (at most 3 rotated by day-of-year)
+        spice_sections = []
+        try:
+            spice_sections = await run_daily_spice_sections()
+        except Exception as e:
+            print(f"[Briefing] Error running spice sections: {e}")
+            try:
+                ActionLogger.log_event(
+                    tool="morning_briefing",
+                    action="spice_sections_error",
+                    error=str(e),
+                    verified=False,
+                )
+            except Exception:
+                pass
+
+        if not self.session:
+            return
+
+        # Build cards for UI dynamic content panel
+        cards = []
+        if not news_failed and news_text:
+            cards.append(f"📰 TOP HEADLINES\n{news_text}")
+        for s in spice_sections:
+            if s.panel_text:
+                cards.append(s.panel_text)
+
+        panel_content = "\n\n────────────────────────────────────────\n\n".join(cards) if cards else ""
+        if panel_content:
+            panel_title = "MORNING BRIEFING" if spice_sections else "NEWS — top world news today"
+            self.ui.show_content(panel_title, panel_content)
+        elif not news_failed and news_text:
+            self.ui.show_content("NEWS — top world news today", news_text)
+
+        # Spoken briefing instruction for Gemini Live turn
+        spice_spoken = [s.spoken_text for s in spice_sections if s.spoken_text]
+        spice_lines = ("\n" + "\n".join(f"- {line}" for line in spice_spoken)) if spice_spoken else ""
+
+        if not news_failed and news_text:
+            briefing_instruction = (
+                f"Give the user a short morning briefing: Greet them warmly and mention it is {time_str}.{name_clause}{session_clause}{reminder_clause}\n\n"
+                f"Here are today's top world headlines:\n{news_text}\n\n"
+                "Pick ONE headline, summarise it in one sentence, and let the user know the full list of headlines is displayed on screen."
+                f"{spice_lines}\n\n"
+                "Keep the entire spoken briefing concise, natural, and under 40 seconds total (around 4 to 5 sentences maximum). "
+                f"Do not call any tools.{lang_clause}"
+            )
+        else:
+            self.ui.write_log("SYS: News headlines unavailable for morning briefing.")
+            briefing_instruction = (
+                f"Give the user a short morning briefing: Greet them warmly and mention it is {time_str}.{name_clause}{session_clause}{reminder_clause} "
+                f"Mention briefly that today's news headlines are currently unavailable, but you are ready to assist.{spice_lines}\n\n"
+                "Keep it concise, natural, and under 40 seconds total (under 4 sentences total). "
+                f"Do not call any tools.{lang_clause}"
             )
 
-        p1 = (
-            f"Greet the user warmly, mention it is {time_str}, and say you are fetching today's news now.{session_clause} "
-            f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
-        )
-
-        # Clear the turn-done event so we can wait for Phase 1 to finish
-        if self._turn_done_event:
-            self._turn_done_event.clear()
-
-        await self.session.send_client_content(
-            turns={"role": "user", "parts": [{"text": p1}]},
-            turn_complete=True,
-        )
-        print("[AGENT] Briefing phase 1 (greeting) sent.")
-
-        # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
-        async def _deliver_news():
+        try:
+            await self.session.send_client_content(
+                turns={"role": "user", "parts": [{"text": briefing_instruction}]},
+                turn_complete=True,
+            )
+            print("[AGENT] Morning briefing delivered.")
+            print(f"[AGENT] 🎙️ Spoken briefing text prompt:\n{briefing_instruction}")
             try:
-                lang_str = (f" Speak in {lang} unless the user has since "
-                            f"spoken another language, in which case use theirs."
-                            if lang else "")
-
-                # Wait for news fetch (already running) and Phase 1 turn-complete
-                # in parallel — whichever takes longer determines the wait time
-                news_done   = asyncio.wrap_future(news_future)
-                turn_waited = False
-                if self._turn_done_event:
-                    try:
-                        await asyncio.wait_for(self._turn_done_event.wait(), timeout=6.0)
-                        turn_waited = True
-                    except asyncio.TimeoutError:
-                        pass
-
-                # Extra buffer: turn_complete fires when Gemini finishes *generating*
-                # Phase 1, but audio may still be playing.  Waiting a beat here
-                # prevents Phase 2 audio from arriving while Phase 1 is mid-sentence
-                # (which sounds like a "repeated first response" to the user).
-                if turn_waited:
-                    await asyncio.sleep(0.8)
-                else:
-                    await asyncio.sleep(1.0)
-
-                try:
-                    news_text = await asyncio.wait_for(news_done, timeout=8.0)
-                except Exception as e:
-                    self.ui.write_log(f"SYS: News fetch timed out/failed: {e!r}")
-                    news_text = ""
-
-                if not self.session:
-                    return
-
-                failed = (not news_text) or news_text.startswith(
-                    ("No news found", "Search failed", "Please provide")
+                ActionLogger.log_event(
+                    tool="morning_briefing",
+                    action="deliver_briefing",
+                    result=briefing_instruction[:200],
+                    verified=True,
                 )
-                if not failed:
-                    # Show on UI content panel immediately
-                    self.ui.show_content("NEWS — top world news today", news_text)
-
-                    p2 = (
-                        f"[BRIEFING] Here are today's top news headlines:\n{news_text}\n\n"
-                        "Pick ONE headline, summarise it in one sentence, then say the full list "
-                        f"is displayed on screen. Do not call any tools.{lang_str}"
-                    )
-                else:
-                    self.ui.write_log(
-                        f"SYS: News unavailable — backend returned: {news_text[:120]!r}"
-                    )
-                    p2 = (
-                        "News headlines could not be fetched right now. "
-                        f"Let the user know briefly.{lang_str}"
-                    )
-
-                await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": p2}]},
-                    turn_complete=True,
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[AGENT] Failed to deliver morning briefing turn: {e}")
+            try:
+                ActionLogger.log_event(
+                    tool="morning_briefing",
+                    action="deliver_briefing",
+                    error=str(e),
+                    verified=False,
                 )
-                print("[AGENT] Briefing phase 2 (news) sent.")
-            except Exception as e:
-                print(f"[Briefing] Phase 2 error: {e}")
-                print(f"[AGENT] Briefing phase 2 failed: {e}")
-                self.ui.write_log("SYS: Could not fetch the news for the briefing.")
-
-        asyncio.create_task(_deliver_news())
+            except Exception:
+                pass
 
     # ── Session memory ──────────────────────────────────────────────────────────
 
@@ -2916,6 +3178,7 @@ class AgentLive:
                     self.audio_in_queue   = asyncio.Queue()
                     self.out_queue        = asyncio.Queue(maxsize=200)
                     self._turn_done_event = asyncio.Event()
+                    self._playback_done_event = asyncio.Event()
 
                     # Reset transient state that must not carry over from a previous session
                     self._pending_vision       = None
@@ -2944,9 +3207,6 @@ class AgentLive:
                         self._awake = False
                         self.ui.set_state("SLEEPING")
                         self.ui.write_log("SYS: AGENT online — sleeping. Say 'Agent' to wake me.")
-                        if not getattr(self, "_greeted_this_session", False):
-                            self._greeted_this_session = True
-                            self.speak("Say exactly this one sentence and nothing else: I'm ready Boss, call out my name.")
                     else:
                         self._awake = True
                         self.ui.set_state("LISTENING")
@@ -2968,10 +3228,11 @@ class AgentLive:
                     if self._dashboard:
                         tg.create_task(self._relay_phone_audio())
 
-                    # Morning briefing — fires once per process launch (if enabled).
-                    # Skipped in wake-word mode: it comes up asleep, and a briefing
-                    # would mean talking while "asleep".
-                    if not self._briefing_sent and get_brief_enabled() and self._awake:
+                    # Wake word mode: announce readiness on initial session connect so user knows AGENT is listening for wake word
+                    if self._wake_enabled and not getattr(self, "_greeted_this_session", False):
+                        self._greeted_this_session = True
+                        self.speak("Say exactly this one sentence and nothing else: I'm ready Boss, call out my name.")
+                    elif not self._briefing_sent and get_brief_enabled() and self._awake:
                         self._briefing_sent = True
                         tg.create_task(self._send_startup_briefing())
 
@@ -3089,6 +3350,9 @@ class AgentLive:
 
             if self._dashboard:
                 await self._dashboard.broadcast({"type": "status", "state": "sleeping"})
+
+            if getattr(self, "_shutting_down", False):
+                break
 
             delay = getattr(self, "_conn_backoff", 3)
             print(f"[AGENT] Reconnecting in {delay}s...")

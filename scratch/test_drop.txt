@@ -1,1 +1,0 @@
-Hello AGENT, this is a test drop payload.

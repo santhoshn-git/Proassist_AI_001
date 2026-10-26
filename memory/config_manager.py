@@ -281,6 +281,56 @@ def save_brief_enabled(enabled: bool) -> None:
     CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
 
 
+DEFAULT_BRIEF_SECTIONS = {
+    "on_this_day": True,
+    "fun_fact": True,
+    "quote_joke": True,
+    "focus": True,
+    "word_of_day": True,
+}
+
+
+def get_brief_sections() -> dict[str, bool]:
+    """Return dictionary of morning briefing section flags, defaulting each to True."""
+    cfg = load_api_keys().get("morning_brief_sections")
+    sections = dict(DEFAULT_BRIEF_SECTIONS)
+    if isinstance(cfg, dict):
+        for k in DEFAULT_BRIEF_SECTIONS:
+            if k in cfg:
+                sections[k] = bool(cfg[k])
+    return sections
+
+
+def get_brief_section_enabled(section_name: str) -> bool:
+    """Return whether a specific briefing section is enabled (default True)."""
+    return get_brief_sections().get(section_name, True)
+
+
+def save_brief_sections(sections: dict) -> None:
+    """Persist morning briefing sections configuration."""
+    ensure_config_dir()
+    data: dict = {}
+    if CONFIG_FILE.exists():
+        try:
+            data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    cur = data.get("morning_brief_sections")
+    cur = dict(cur) if isinstance(cur, dict) else dict(DEFAULT_BRIEF_SECTIONS)
+    for k, v in (sections or {}).items():
+        if k in DEFAULT_BRIEF_SECTIONS:
+            cur[k] = bool(v)
+    data["morning_brief_sections"] = cur
+    CONFIG_FILE.write_text(json.dumps(data, indent=4), encoding="utf-8")
+
+
+def save_brief_section_enabled(section_name: str, enabled: bool) -> None:
+    """Persist enable/disable state for a single briefing section."""
+    if section_name in DEFAULT_BRIEF_SECTIONS:
+        save_brief_sections({section_name: bool(enabled)})
+
+
+
 # ── Audio devices ────────────────────────────────────────────────────────────
 # Stored as device NAMES, not sounddevice indices. Indices shift every time a
 # USB device is plugged in or removed, so a saved index silently starts pointing

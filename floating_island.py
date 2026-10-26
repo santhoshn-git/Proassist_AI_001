@@ -25,6 +25,7 @@ import sys
 import re
 import math
 import html
+import threading
 import webbrowser
 from pathlib import Path
 from PyQt6.QtCore import (
@@ -45,6 +46,16 @@ try:
 except ImportError:
     # Fallback if run standalone from another directory
     from .icons import icon  # type: ignore
+
+try:
+    from core.app_icon import get_app_icon
+except ImportError:
+    try:
+        from .core.app_icon import get_app_icon  # type: ignore
+    except ImportError:
+        def get_app_icon():
+            from PyQt6.QtGui import QIcon
+            return QIcon()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -344,6 +355,7 @@ class FloatingIsland(QWidget):
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setWindowIcon(get_app_icon())
 
         self._assistant_name = "ProAssist AI"
         if main_window and hasattr(main_window, "_assistant_name"):
@@ -815,6 +827,9 @@ class FloatingIsland(QWidget):
 
     def set_view_state(self, state: str):
         """Transition between primary (collapsed pill) and secondary (expanded card)."""
+        if threading.current_thread() is not threading.main_thread():
+            QTimer.singleShot(0, lambda s=state: self.set_view_state(s))
+            return
         st = str(state).lower().strip()
         if st == "secondary":
             if not self._is_expanded:
@@ -895,6 +910,9 @@ class FloatingIsland(QWidget):
         QTimer.singleShot(1200, lambda: self.set_view_state("primary"))
 
     def on_state_changed(self, state: str):
+        if threading.current_thread() is not threading.main_thread():
+            QTimer.singleShot(0, lambda s=state: self.on_state_changed(s))
+            return
         st = state.upper()
         self._status_circle.set_state(st)
 
@@ -1255,6 +1273,9 @@ class FloatingIsland(QWidget):
     # ── Transitions & Expansion ──────────────────────────────────────────────
     def expand(self):
         """Transition from STATE 1 (collapsed pill) directly to expanded card in one animation."""
+        if threading.current_thread() is not threading.main_thread():
+            QTimer.singleShot(0, self.expand)
+            return
         if self._is_expanded:
             return
         self._is_expanded = True
@@ -1292,6 +1313,9 @@ class FloatingIsland(QWidget):
 
     def collapse(self):
         """Transition from STATE 2 (mid-expand card) to STATE 1 (collapsed pill)."""
+        if threading.current_thread() is not threading.main_thread():
+            QTimer.singleShot(0, self.collapse)
+            return
         if not self._is_expanded:
             return
         self._is_expanded = False

@@ -21,9 +21,20 @@ else:
 from PyQt6.QtCore import (
     QEasingCurve, QLineF, QMimeData, QObject, QParallelAnimationGroup, QPointF,
     QPropertyAnimation, QRect, QRectF, QSize, Qt, QTimer, QUrl, pyqtSignal,
+    qInstallMessageHandler,
 )
+
+def _qt_message_handler(msg_type, context, message):
+    if "killTimer" in message or "another thread" in message:
+        tname = threading.current_thread().name
+        print(f"\n[Qt Warning] {message} on thread '{tname}'", file=sys.stderr)
+        traceback.print_stack(file=sys.stderr)
+    elif os.environ.get("DEBUG_QT", "0") == "1":
+        print(f"[Qt] {message}", file=sys.stderr)
+
+qInstallMessageHandler(_qt_message_handler)
 from PyQt6.QtGui import (
-    QBrush, QColor, QConicalGradient, QDragEnterEvent, QDropEvent, QFont,
+    QBrush, QColor, QConicalGradient, QDesktopServices, QDragEnterEvent, QDropEvent, QFont,
     QFontDatabase, QIcon, QKeySequence, QLinearGradient, QPainter, QPainterPath,
     QPen, QPixmap, QRadialGradient, QShortcut,
 )
@@ -43,6 +54,16 @@ try:
 except Exception:
     def icon(name: str, active: bool = False):
         return QIcon()
+
+try:
+    from core.app_icon import get_app_icon, get_app_icon_path, get_app_icon_png_path
+except Exception:
+    def get_app_icon():
+        return QIcon()
+    def get_app_icon_path():
+        return None
+    def get_app_icon_png_path():
+        return None
 
 
 def _base_dir() -> Path:
@@ -286,6 +307,12 @@ class _SysMetrics:
         t.start()
 
     def _loop(self):
+        if _OS == "Windows":
+            try:
+                import pythoncom
+                pythoncom.CoInitialize()
+            except Exception:
+                pass
         while self._running:
             try:
                 self._update()
@@ -488,6 +515,11 @@ class HudCanvas(QWidget):
                 self._avatar.glance(dx, dy, hold)
         except Exception:
             pass
+
+    def reset_visemes(self) -> None:
+        """Discard any queued viseme schedule (e.g. on interrupt)."""
+        self._visemes = None
+        self._vis_i = None
 
     def push_visemes(self, frames, hop: float, at: float) -> None:
         """Thread-safe: hand over a schedule of (level, openness, width) frames.
@@ -1432,15 +1464,18 @@ class _CameraPreview(QWidget):
 
 class SetupOverlay(QWidget):
     done = pyqtSignal(str, str)
+    cancelled = pyqtSignal()
+    _OW, _OH = 480, 410
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, current_key: str = "", can_cancel: bool = False):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             SetupOverlay {{
                 background: {C.PANEL};
                 border: 1px solid {C.BORDER};
-                border-radius: 6px;
+                border-radius: 14px;
             }}
         """)
 
@@ -1450,58 +1485,151 @@ class SetupOverlay(QWidget):
         self._sel_os = detected
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(30, 22, 30, 22)
-        layout.setSpacing(8)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(10)
 
-        def _lbl(txt, font_size=9, bold=False, color=C.PRI,
-                 align=Qt.AlignmentFlag.AlignCenter):
-            w = QLabel(txt)
-            w.setAlignment(align)
-            w.setFont(QFont("Courier New", font_size,
-                            QFont.Weight.Bold if bold else QFont.Weight.Normal))
-            w.setStyleSheet(f"color: {color}; background: transparent;")
-            return w
+        # ── Header row ────────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        hdr.setSpacing(8)
 
-        layout.addWidget(_lbl("◈  INITIALISATION REQUIRED", 13, True))
-        layout.addWidget(_lbl("Configure AGENT before first boot.", 9, color=C.PRI_DIM))
-        layout.addSpacing(6)
+        badge = QFrame()
+        badge.setFixedSize(28, 28)
+        badge.setStyleSheet(f"""
+            QFrame {{
+                background: {C.ACT_BG};
+                border: 1px solid {C.ACT_BORDER};
+                border-radius: 8px;
+            }}
+        """)
+        b_lay = QHBoxLayout(badge)
+        b_lay.setContentsMargins(0, 0, 0, 0)
+        b_icon = QLabel()
+        b_icon.setPixmap(icon("lock", active=True).pixmap(14, 14))
+        b_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        b_lay.addWidget(b_icon)
+        hdr.addWidget(badge)
 
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep)
-        layout.addSpacing(4)
+        title_lbl = QLabel("Gemini API Key Setup")
+        title_lbl.setFont(_app_font(11, bold=True))
+        title_lbl.setStyleSheet("color: #f2f2f2; background: transparent;")
+        hdr.addWidget(title_lbl)
+        hdr.addStretch()
 
-        layout.addWidget(_lbl("GEMINI API KEY", 8, color=C.TEXT_DIM,
-                               align=Qt.AlignmentFlag.AlignLeft))
-        self._key_input = QLineEdit()
+        if can_cancel:
+            close_btn = QPushButton("×")
+            close_btn.setFixedSize(26, 26)
+            close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            close_btn.setStyleSheet("""
+                QPushButton {
+                    background: #1c1e1d; color: #8a8f8d;
+                    border: 1px solid #2a2c2b; border-radius: 13px;
+                    font-size: 14px;
+                }
+                QPushButton:hover { color: #f2f2f2; border-color: #262a28; }
+            """)
+            close_btn.clicked.connect(self._cancel)
+            hdr.addWidget(close_btn)
+
+        layout.addLayout(hdr)
+
+        sub_lbl = QLabel("Paste your Google Gemini API key to power live voice, AI reasoning, and desktop actions.")
+        sub_lbl.setFont(_app_font(8.5))
+        sub_lbl.setStyleSheet("color: #8a8f8d; background: transparent;")
+        sub_lbl.setWordWrap(True)
+        layout.addWidget(sub_lbl)
+
+        # ── Link to Google AI Studio ──────────────────────────────────────────
+        link_row = QHBoxLayout()
+        link_row.setSpacing(6)
+        link_lbl = QLabel("Don't have an API key?")
+        link_lbl.setFont(_app_font(8.5))
+        link_lbl.setStyleSheet("color: #8a8f8d; background: transparent;")
+        link_row.addWidget(link_lbl)
+
+        get_key_btn = QPushButton("Get Free Key at Google AI Studio ↗")
+        get_key_btn.setFont(_app_font(8.5, bold=True))
+        get_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        get_key_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.PRI};
+                border: none; text-align: left; padding: 0;
+            }}
+            QPushButton:hover {{ text-decoration: underline; }}
+        """)
+        get_key_btn.clicked.connect(lambda: QDesktopServices.openUrl(QUrl("https://aistudio.google.com/app/apikey")))
+        link_row.addWidget(get_key_btn)
+        link_row.addStretch()
+        layout.addLayout(link_row)
+
+        layout.addSpacing(2)
+
+        # ── API Key Input Row ─────────────────────────────────────────────────
+        key_lbl = QLabel("GEMINI API KEY")
+        key_lbl.setFont(_app_font(8, bold=True))
+        key_lbl.setStyleSheet("color: #8a8f8d; background: transparent;")
+        layout.addWidget(key_lbl)
+
+        key_row = QHBoxLayout()
+        key_row.setSpacing(6)
+
+        self._key_input = QLineEdit(current_key)
         self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
-        self._key_input.setPlaceholderText("AIza…")
-        self._key_input.setFont(QFont("Courier New", 10))
-        self._key_input.setFixedHeight(32)
+        self._key_input.setPlaceholderText("Paste API key here (AIza...)")
+        self._key_input.setFont(QFont("Consolas", 10))
+        self._key_input.setFixedHeight(36)
         self._key_input.setStyleSheet(f"""
             QLineEdit {{
-                background: {C.PANEL}; color: {C.TEXT};
-                border: 1px solid {C.BORDER}; border-radius: 3px; padding: 4px 8px;
+                background: #1c1e1d; color: #f2f2f2;
+                border: 1px solid #2a2c2b; border-radius: 8px; padding: 4px 10px;
             }}
             QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
         """)
-        layout.addWidget(self._key_input)
-        layout.addSpacing(12)
+        key_row.addWidget(self._key_input, stretch=1)
 
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"color: {C.BORDER};"); layout.addWidget(sep2)
+        self._show_key_btn = QPushButton("Show")
+        self._show_key_btn.setFixedSize(50, 36)
+        self._show_key_btn.setFont(_app_font(8))
+        self._show_key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._show_key_btn.setStyleSheet("""
+            QPushButton {
+                background: #1c1e1d; color: #8a8f8d;
+                border: 1px solid #2a2c2b; border-radius: 8px;
+            }
+            QPushButton:hover { color: #f2f2f2; border-color: #262a28; }
+        """)
+        self._show_key_btn.clicked.connect(self._toggle_echo_mode)
+        key_row.addWidget(self._show_key_btn)
+
+        paste_btn = QPushButton("Paste")
+        paste_btn.setFixedSize(54, 36)
+        paste_btn.setFont(_app_font(8, bold=True))
+        paste_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        paste_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #1c1e1d; color: {C.PRI};
+                border: 1px solid #2a2c2b; border-radius: 8px;
+            }}
+            QPushButton:hover {{ border-color: {C.PRI}; background: {C.ACT_BG}; }}
+        """)
+        paste_btn.clicked.connect(self._paste_clipboard)
+        key_row.addWidget(paste_btn)
+
+        layout.addLayout(key_row)
+
         layout.addSpacing(4)
 
-        layout.addWidget(_lbl("OPERATING SYSTEM", 8, color=C.TEXT_DIM,
-                               align=Qt.AlignmentFlag.AlignLeft))
-        det_name = {"windows": "Windows", "mac": "macOS", "linux": "Linux"}[detected]
-        layout.addWidget(_lbl(f"Auto-detected: {det_name}", 8, color=C.ACC2,
-                               align=Qt.AlignmentFlag.AlignLeft))
+        # ── Operating System ──────────────────────────────────────────────────
+        os_hdr = QLabel("OPERATING SYSTEM")
+        os_hdr.setFont(_app_font(8, bold=True))
+        os_hdr.setStyleSheet("color: #8a8f8d; background: transparent;")
+        layout.addWidget(os_hdr)
 
-        os_row = QHBoxLayout(); os_row.setSpacing(6)
+        os_row = QHBoxLayout()
+        os_row.setSpacing(6)
         self._os_btns: dict[str, QPushButton] = {}
-        for key, label in [("windows","⊞  Windows"),("mac","  macOS"),("linux","🐧  Linux")]:
+        for key, label in [("windows", "⊞  Windows"), ("mac", "🍎  macOS"), ("linux", "🐧  Linux")]:
             btn = QPushButton(label)
-            btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+            btn.setFont(_app_font(8.5, bold=True))
             btn.setFixedHeight(32)
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             btn.clicked.connect(lambda _, k=key: self._sel(k))
@@ -1509,52 +1637,91 @@ class SetupOverlay(QWidget):
             self._os_btns[key] = btn
         layout.addLayout(os_row)
         self._sel(detected)
-        layout.addSpacing(12)
 
-        init_btn = QPushButton("▸  INITIALISE SYSTEMS")
-        init_btn.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
-        init_btn.setFixedHeight(36)
+        layout.addSpacing(8)
+
+        # ── Action Buttons ────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        init_btn = QPushButton("✓  Save & Apply Key")
+        init_btn.setFont(_app_font(9.5, bold=True))
+        init_btn.setFixedHeight(38)
         init_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         init_btn.setStyleSheet(f"""
             QPushButton {{
                 background: {C.ACT_BG}; color: {C.PRI};
-                border: 1px solid {C.ACT_BORDER}; border-radius: 3px;
+                border: 1px solid {C.ACT_BORDER}; border-radius: 9px;
             }}
             QPushButton:hover {{
                 background: {C.ACT_BG}; border-color: {C.PRI};
             }}
         """)
         init_btn.clicked.connect(self._submit)
-        layout.addWidget(init_btn)
+        btn_row.addWidget(init_btn, stretch=1)
+
+        if can_cancel:
+            cancel_btn = QPushButton("Cancel")
+            cancel_btn.setFont(_app_font(9.5))
+            cancel_btn.setFixedHeight(38)
+            cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            cancel_btn.setStyleSheet("""
+                QPushButton {
+                    background: #1c1e1d; color: #c9cccb;
+                    border: 1px solid #2a2c2b; border-radius: 9px;
+                }
+                QPushButton:hover { color: #f2f2f2; border-color: #262a28; }
+            """)
+            cancel_btn.clicked.connect(self._cancel)
+            btn_row.addWidget(cancel_btn)
+
+        layout.addLayout(btn_row)
+
+    def _toggle_echo_mode(self):
+        if self._key_input.echoMode() == QLineEdit.EchoMode.Password:
+            self._key_input.setEchoMode(QLineEdit.EchoMode.Normal)
+            self._show_key_btn.setText("Hide")
+        else:
+            self._key_input.setEchoMode(QLineEdit.EchoMode.Password)
+            self._show_key_btn.setText("Show")
+
+    def _paste_clipboard(self):
+        txt = QApplication.clipboard().text().strip()
+        if txt:
+            self._key_input.setText(txt)
+
+    def _cancel(self):
+        self.cancelled.emit()
+        self.hide()
 
     def _sel(self, key: str):
         self._sel_os = key
-        pal = {"windows":(C.PRI, C.ACT_BG), "mac":(C.ACC2, "#1a1400"), "linux":(C.GREEN, C.ACT_BG)}
         for k, btn in self._os_btns.items():
             if k == key:
-                fg, bg = pal[k]
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        background: {fg}; color: {bg};
-                        border: none; border-radius: 3px; font-weight: bold;
+                        background: {C.ACT_BG}; color: {C.PRI};
+                        border: 1px solid {C.PRI}; border-radius: 6px; font-weight: bold;
                     }}
                 """)
             else:
                 btn.setStyleSheet(f"""
                     QPushButton {{
-                        background: {C.BTN_BG}; color: {C.TEXT_DIM};
-                        border: 1px solid {C.BTN_BORDER}; border-radius: 3px;
+                        background: #1c1e1d; color: #8a8f8d;
+                        border: 1px solid #2a2c2b; border-radius: 6px;
                     }}
-                    QPushButton:hover {{ color: {C.TEXT}; border: 1px solid {C.BORDER}; }}
+                    QPushButton:hover {{ color: #f2f2f2; border-color: #262a28; }}
                 """)
 
     def _submit(self):
         key = self._key_input.text().strip()
         if not key:
-            self._key_input.setStyleSheet(
-                self._key_input.styleSheet() +
-                f" QLineEdit {{ border: 1px solid {C.RED}; }}"
-            )
+            self._key_input.setStyleSheet(f"""
+                QLineEdit {{
+                    background: #1c1e1d; color: #f2f2f2;
+                    border: 1px solid {C.RED}; border-radius: 8px; padding: 4px 10px;
+                }}
+            """)
             return
         self.done.emit(key, self._sel_os)
 
@@ -1657,11 +1824,13 @@ class CustomizeOverlay(QWidget):
     """Floating overlay — change assistant name, user name, UI colour and voice."""
 
     saved = pyqtSignal(str, str, str, str)   # assistant_name, user_name, ui_color, voice
-    _OW, _OH = 380, 580
+    edit_key_requested = pyqtSignal()
+    _OW, _OH = 380, 620
 
     def __init__(self, assistant_name="AGENT", user_name="",
                  ui_color=DEFAULT_UI_COLOR, voice="", parent=None):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             CustomizeOverlay {{
@@ -1833,6 +2002,30 @@ class CustomizeOverlay(QWidget):
         self._hex_input.textEdited.connect(self._on_hex_edited)
         lay.addWidget(self._hex_input)
 
+        # ── Gemini API Key row ────────────────────────────────────────────────
+        api_box = QHBoxLayout()
+        api_lbl = QLabel("Gemini API Key")
+        api_lbl.setFont(_app_font(8.5))
+        api_lbl.setStyleSheet("color: #8a8f8d; background: transparent;")
+        api_box.addWidget(api_lbl)
+        api_box.addStretch()
+
+        key_btn = QPushButton("🔑 Configure / Change Key ↗")
+        key_btn.setFixedHeight(26)
+        key_btn.setFont(_app_font(8, bold=True))
+        key_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        key_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: #1c1e1d; color: {C.PRI};
+                border: 1px solid #2a2c2b; border-radius: 8px;
+                padding: 0 10px;
+            }}
+            QPushButton:hover {{ border-color: {C.PRI}; background: {C.ACT_BG}; }}
+        """)
+        key_btn.clicked.connect(self._request_edit_key)
+        api_box.addWidget(key_btn)
+        lay.addLayout(api_box)
+
         # ── Action buttons (Apply / Cancel) ──────────────────────────────────
         btn_row = QHBoxLayout()
         btn_row.setSpacing(10)
@@ -1940,6 +2133,10 @@ class CustomizeOverlay(QWidget):
         self.saved.emit(name, user, self._sel_color or DEFAULT_UI_COLOR, self._sel_voice)
         self.hide()
 
+    def _request_edit_key(self):
+        self.edit_key_requested.emit()
+        self.hide()
+
 
 class PluginManagerOverlay(QWidget):
     """Floating overlay — lists discovered plugins with per-plugin ON/OFF toggles."""
@@ -1948,6 +2145,7 @@ class PluginManagerOverlay(QWidget):
 
     def __init__(self, plugins: list[dict], parent=None):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             PluginManagerOverlay {{
@@ -2059,6 +2257,10 @@ class _HudOverlay(QWidget):
     invalidates the region they occupy when they hide or shrink: the HUD keeps
     painting around them and their last frame stays on screen as a ghost. Any
     overlay positioned with _centre_overlay needs this."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
 
     def hideEvent(self, e):
         p = self.parentWidget()
@@ -2889,6 +3091,7 @@ class PluginSettingsOverlay(QWidget):
 
     def __init__(self, sections: list[dict], parent=None):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             PluginSettingsOverlay {{
@@ -3139,6 +3342,7 @@ class RemoteKeyOverlay(QWidget):
     def __init__(self, url: str, key: str, auto_login_url: str = "",
                  manual_url: str = "", expiry_secs: int = 600, parent=None):
         super().__init__(parent)
+        self.setWindowIcon(get_app_icon())
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet(f"""
             RemoteKeyOverlay {{
@@ -3308,6 +3512,9 @@ class RemoteKeyOverlay(QWidget):
 
     def mark_connected(self) -> None:
         """Call from any thread when a phone successfully connects."""
+        if threading.current_thread() is not threading.main_thread():
+            QTimer.singleShot(0, self.mark_connected)
+            return
         self._ctimer.stop()
         self._key_lbl.setText("CONNECTED")
         self._key_lbl.setStyleSheet(f"""
@@ -3355,6 +3562,9 @@ class RemoteKeyOverlay(QWidget):
                 self._tick()
 
     def _do_close(self):
+        if threading.current_thread() is not threading.main_thread():
+            QTimer.singleShot(0, self._do_close)
+            return
         self._ctimer.stop()
         self.hide()
         self.closed.emit()
@@ -3379,6 +3589,7 @@ class MainWindow(QMainWindow):
     _quiz_hide_sig  = pyqtSignal()
     _review_sig     = pyqtSignal(str, str, object, object)  # document review payload
     _phone_mic_sig  = pyqtSignal(bool)                      # phone mic live indicator
+    _phone_connected_sig = pyqtSignal()                    # phone audio/playback connected indicator
 
     def __init__(self, face_path: str):
         super().__init__()
@@ -3395,6 +3606,7 @@ class MainWindow(QMainWindow):
             apply_ui_accent(_ui_color)
 
         self.setWindowTitle(f"{_display} — {APP_VERSION}")
+        self.setWindowIcon(get_app_icon())
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
@@ -3405,6 +3617,7 @@ class MainWindow(QMainWindow):
         )
 
         self.on_text_command   = None
+        self.on_close_requested = None  # callable: () -> None — graceful application shutdown
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop AGENT mid-speech
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
@@ -3422,6 +3635,7 @@ class MainWindow(QMainWindow):
         self._current_file: str | None = None
         self._remote_overlay: RemoteKeyOverlay | None = None
         self._customize_overlay: CustomizeOverlay | None = None
+        self.on_api_key_change = None
 
         central = QWidget()
         central.setStyleSheet(f"background: {C.BG};")
@@ -3601,6 +3815,7 @@ class MainWindow(QMainWindow):
         self._quiz_hide_sig.connect(self._hide_quiz)
         self._review_sig.connect(self._show_review)
         self._phone_mic_sig.connect(self._set_phone_mic_pill_visible)
+        self._phone_connected_sig.connect(self.notify_phone_connected)
         self._cam_stop = threading.Event()
 
         # Camera preview overlay (child of central widget, positioned in resizeEvent)
@@ -3807,54 +4022,77 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _create_lnk_windows(lnk: str, target: str, args: str,
-                             work_dir: str, icon_loc: str) -> None:
+                             work_dir: str, icon_loc: str,
+                             desc: str = "ProAssist AGENT 001") -> None:
         """
-        Create a Windows .lnk shortcut WITHOUT launching PowerShell or cmd.
-        Tries win32com (pywin32) first; falls back to wscript.exe + VBScript.
-        wscript.exe is a GUI-mode host — it never opens a console window.
+        Create a Windows .lnk shortcut with pywin32 COM (with CoInitialize/CoUninitialize),
+        falling back to PowerShell WScript.Shell.
         """
-        # ── Option 1: pywin32 (pure Python COM, zero subprocess) ──────────
-        try:
-            from win32com.client import Dispatch   # type: ignore
-            sh = Dispatch("WScript.Shell")
-            sc = sh.CreateShortCut(lnk)
-            sc.TargetPath       = target
-            sc.Arguments        = f'"{args}"'
-            sc.WorkingDirectory = work_dir
-            sc.Description      = "AGENT AI Assistant"
-            sc.IconLocation     = icon_loc
-            sc.save()
-            return
-        except ImportError:
-            pass
+        assert lnk.lower().endswith(".lnk"), f"The shortcut pathname must end with .lnk: {lnk}"
+        lnk = os.path.normpath(lnk)
+        target = os.path.normpath(target)
+        work_dir = os.path.normpath(work_dir)
 
-        # ── Option 2: wscript.exe + VBScript (always available on Windows,
-        #    GUI-mode executable — never opens a console window) ────────────
-        vbs = "\n".join([
-            'Set ws = CreateObject("WScript.Shell")',
-            f'Set sc = ws.CreateShortcut("{lnk}")',
-            f'sc.TargetPath = "{target}"',
-            f'sc.Arguments = Chr(34) & "{args}" & Chr(34)',
-            f'sc.WorkingDirectory = "{work_dir}"',
-            'sc.Description = "AGENT AI Assistant"',
-            f'sc.IconLocation = "{icon_loc}"',
-            'sc.Save',
-        ])
-        import tempfile
-        fd, tmp = tempfile.mkstemp(suffix=".vbs")
+        # ── Option 1: pywin32 COM ─────────────────────────────────────────
+        co_init = False
+        last_err: Exception | None = None
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(vbs)
-            proc = subprocess.Popen(
-                ["wscript.exe", "/nologo", tmp],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-            )
-            proc.wait(timeout=10)
-        finally:
             try:
-                os.unlink(tmp)
+                import pythoncom
+                pythoncom.CoInitialize()
+                co_init = True
             except Exception:
                 pass
+
+            from win32com.client import Dispatch   # type: ignore
+            sh = Dispatch("WScript.Shell")
+            sc = sh.CreateShortcut(lnk)
+            sc.TargetPath       = target
+            sc.Arguments        = args
+            sc.WorkingDirectory = work_dir
+            sc.Description      = desc
+            sc.IconLocation     = icon_loc
+            sc.Save()
+
+            del sc
+            del sh
+            import gc
+            gc.collect()
+            return
+        except Exception as com_err:
+            last_err = com_err
+        finally:
+            if co_init:
+                try:
+                    import pythoncom
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+        # ── Option 2: PowerShell one-liner fallback ───────────────────────
+        try:
+            esc = lambda s: str(s).replace('"', '`"').replace("'", "''")
+            ps_cmd = (
+                f"$ws = New-Object -ComObject WScript.Shell; "
+                f"$sc = $ws.CreateShortcut('{esc(lnk)}'); "
+                f"$sc.TargetPath = '{esc(target)}'; "
+                f"$sc.Arguments = '{esc(args)}'; "
+                f"$sc.WorkingDirectory = '{esc(work_dir)}'; "
+                f"$sc.IconLocation = '{esc(icon_loc)}'; "
+                f"$sc.Description = '{esc(desc)}'; "
+                f"$sc.Save()"
+            )
+            res = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_cmd],
+                capture_output=True,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            if res.returncode != 0:
+                err_text = res.stderr.strip() or res.stdout.strip()
+                raise RuntimeError(err_text or f"PowerShell exited with code {res.returncode}")
+        except Exception as ps_err:
+            raise RuntimeError(f"COM failed ({last_err}); PowerShell failed ({ps_err})") from ps_err
 
     @staticmethod
     def _get_desktop_dir() -> Path:
@@ -3871,8 +4109,7 @@ class MainWindow(QMainWindow):
         _os = platform.system()
 
         if _os == "Windows":
-            # ── 1) SHGetKnownFolderPath(FOLDERID_Desktop) — the canonical
-            #       answer; follows OneDrive redirection. No dependencies. ──
+            # ── 1) SHGetKnownFolderPath(FOLDERID_Desktop) — canonical answer ──
             try:
                 import ctypes
                 from ctypes import wintypes
@@ -3890,14 +4127,25 @@ class MainWindow(QMainWindow):
                 buf = ctypes.c_wchar_p()
                 if ctypes.windll.shell32.SHGetKnownFolderPath(
                         ctypes.byref(fid), 0, None, ctypes.byref(buf)) == 0:
-                    p = Path(buf.value)
+                    val = buf.value
                     ctypes.windll.ole32.CoTaskMemFree(buf)
-                    if p.is_dir():
-                        return p
+                    if val and os.path.isdir(val):
+                        return Path(val)
             except Exception:
                 pass
 
-            # ── 2) Registry: User Shell Folders (may contain %VARS%) ──────
+            # ── 2) WScript.Shell SpecialFolders("Desktop") ─────────────────
+            try:
+                from win32com.client import Dispatch
+                sh = Dispatch("WScript.Shell")
+                sp = sh.SpecialFolders("Desktop")
+                del sh
+                if sp and os.path.isdir(sp):
+                    return Path(sp)
+            except Exception:
+                pass
+
+            # ── 3) Registry: User Shell Folders (may contain %VARS%) ──────
             try:
                 import winreg
                 with winreg.OpenKey(
@@ -3905,11 +4153,16 @@ class MainWindow(QMainWindow):
                         r"Software\Microsoft\Windows\CurrentVersion"
                         r"\Explorer\User Shell Folders") as key:
                     val, _t = winreg.QueryValueEx(key, "Desktop")
-                p = Path(os.path.expandvars(val))
-                if p.is_dir():
-                    return p
+                expanded = os.path.expandvars(val)
+                if expanded and os.path.isdir(expanded):
+                    return Path(expanded)
             except Exception:
                 pass
+
+            # ── 4) Standard fallback: ~/Desktop ───────────────────────────
+            fb = os.path.join(os.path.expanduser("~"), "Desktop")
+            if os.path.isdir(fb):
+                return Path(fb)
 
         elif _os == "Linux":
             # ── xdg-user-dir honours localized names (~/Masaüstü, …) ──────
@@ -3943,37 +4196,62 @@ class MainWindow(QMainWindow):
         Never opens a terminal, console, or PowerShell window on any platform.
         """
         import stat as _stat
-        script  = Path(__file__).resolve().parent / "main.py"
-        python  = Path(sys.executable)
+        project_root = Path(__file__).resolve().parent
+        script  = project_root / "main.py"
         desktop = self._get_desktop_dir()
 
-        # Arc-reactor icon (.ico — also exported as .png for Linux/macOS)
-        ico_path = Path(__file__).resolve().parent / "config" / "jarvis.ico"
+        # ProAssist icon (.ico — also exported/available as .png for Linux/macOS)
+        ico_path = get_app_icon_path()
+        if not ico_path or not ico_path.exists():
+            ico_path = project_root / "assets" / "proassist_icon.ico"
         if not ico_path.exists():
-            self._build_jarvis_icon(ico_path)
+            ico_path = project_root / "config" / "jarvis.ico"
+            if not ico_path.exists():
+                self._build_jarvis_icon(ico_path)
+
+        _os = platform.system()
+        created_path = ""
+        success = False
+        err_msg = ""
 
         try:
-            _os = platform.system()
-
             # ── Windows ───────────────────────────────────────────────────────
             if _os == "Windows":
-                pythonw  = python.parent / "pythonw.exe"
-                target   = str(pythonw if pythonw.exists() else python)
-                lnk      = str(desktop / "AGENTlnk")
-                icon_loc = str(ico_path) if ico_path.exists() else f"{target},0"
-                self._create_lnk_windows(lnk, target, str(script),
-                                         str(script.parent), icon_loc)
+                shortcut_name = "ProAssist AGENT.lnk"
+                lnk = os.path.normpath(os.path.join(str(desktop), shortcut_name))
+                assert lnk.lower().endswith(".lnk"), f"The shortcut pathname must end with .lnk: {lnk}"
+
+                if getattr(sys, "frozen", False):
+                    target = str(Path(sys.executable).resolve())
+                    args = ""
+                else:
+                    python = Path(sys.executable)
+                    pythonw = python.parent / "pythonw.exe"
+                    target = str(pythonw if pythonw.exists() else python)
+                    args = f'"{script}"'
+
+                icon_loc = f"{os.path.normpath(str(ico_path))},0" if ico_path and ico_path.exists() else f"{target},0"
+                work_dir = os.path.normpath(str(project_root))
+
+                self._create_lnk_windows(
+                    lnk=lnk,
+                    target=target,
+                    args=args,
+                    work_dir=work_dir,
+                    icon_loc=icon_loc,
+                    desc="ProAssist AGENT 001",
+                )
+                created_path = lnk
 
             # ── macOS — proper .app bundle (no Terminal window) ───────────────
             elif _os == "Darwin":
-                app     = desktop / "AGENTapp"
+                app     = desktop / "ProAssist AGENT.app"
                 mac_dir = app / "Contents" / "MacOS"
                 res_dir = app / "Contents" / "Resources"
                 mac_dir.mkdir(parents=True, exist_ok=True)
                 res_dir.mkdir(exist_ok=True)
 
-                # Launcher executable (bash — runs as background process,
-                # macOS does NOT open Terminal for executables inside .app bundles)
+                python  = Path(sys.executable)
                 launcher = mac_dir / "AGENT"
                 launcher.write_text(
                     "#!/usr/bin/env bash\n"
@@ -3983,7 +4261,6 @@ class MainWindow(QMainWindow):
                 launcher.chmod(launcher.stat().st_mode
                                | _stat.S_IEXEC | _stat.S_IXGRP | _stat.S_IXOTH)
 
-                # Minimal Info.plist (required for .app recognition)
                 (app / "Contents" / "Info.plist").write_text(
                     '<?xml version="1.0" encoding="UTF-8"?>\n'
                     '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
@@ -3991,19 +4268,17 @@ class MainWindow(QMainWindow):
                     '<plist version="1.0"><dict>\n'
                     '  <key>CFBundleExecutable</key><string>AGENT</string>\n'
                     '  <key>CFBundleIdentifier</key>'
-                    '<string>com.jarvis.assistant</string>\n'
-                    '  <key>CFBundleName</key><string>AGENT</string>\n'
+                    '<string>com.proassist.agent</string>\n'
+                    '  <key>CFBundleName</key><string>ProAssist AGENT</string>\n'
                     '  <key>CFBundlePackageType</key><string>APPL</string>\n'
                     '  <key>CFBundleVersion</key><string>1.0</string>\n'
                     '</dict></plist>\n'
                 )
 
-                # Optional: copy icon as .icns (skip silently if Pillow is missing)
                 try:
                     import PIL.Image
                     icns = res_dir / "AppIcon.icns"
                     PIL.Image.open(ico_path).save(icns, format="ICNS")
-                    # Inject icon reference into plist
                     plist = app / "Contents" / "Info.plist"
                     txt = plist.read_text()
                     plist.write_text(
@@ -4014,12 +4289,14 @@ class MainWindow(QMainWindow):
                         )
                     )
                 except Exception:
-                    pass  # icon is optional
+                    pass
+                created_path = str(app)
 
             # ── Linux — .desktop file (Terminal=false, no console) ────────────
             else:
-                # Export .ico → .png for better desktop integration
-                png_path = ico_path.with_suffix(".png")
+                png_path = get_app_icon_png_path()
+                if not png_path or not png_path.exists():
+                    png_path = ico_path.with_suffix(".png")
                 if not png_path.exists() and ico_path.exists():
                     try:
                         import PIL.Image
@@ -4027,25 +4304,64 @@ class MainWindow(QMainWindow):
                             (256, 256), PIL.Image.LANCZOS
                         ).save(png_path, format="PNG")
                     except Exception:
-                        png_path = ico_path  # fallback to .ico
+                        png_path = ico_path
 
                 icon_line = f"Icon={png_path}\n" if png_path.exists() else ""
-                desk = desktop / "AGENTdesktop"
-                desk.write_text(
+                desktop_entry_content = (
                     "[Desktop Entry]\n"
-                    "Name=AGENT\n"
-                    f"Exec={python} {script}\n"
+                    "Name=ProAssist AGENT\n"
+                    f"Exec={sys.executable} {script}\n"
                     f"Path={script.parent}\n"
                     "Type=Application\n"
                     "Terminal=false\n"
                     "Categories=Utility;\n"
                     + icon_line
                 )
-                desk.chmod(desk.stat().st_mode | 0o755)
 
-            self._log.append_log("SYS: Desktop shortcut created.")
+                linux_targets = [
+                    Path.home() / ".local" / "share" / "applications" / "proassist-agent.desktop",
+                    desktop / "proassist-agent.desktop",
+                ]
+                for target_file in linux_targets:
+                    try:
+                        target_file.parent.mkdir(parents=True, exist_ok=True)
+                        target_file.write_text(desktop_entry_content, encoding="utf-8")
+                        target_file.chmod(target_file.stat().st_mode | 0o755)
+                    except Exception:
+                        pass
+                created_path = str(desktop / "proassist-agent.desktop")
+
+            # Verify file exists on disk
+            if os.path.exists(created_path):
+                success = True
+                self._log.append_log(f"SYS: Desktop shortcut created: {created_path}")
+            else:
+                raise FileNotFoundError(f"Shortcut file was not found on disk at {created_path}")
+
         except Exception as e:
-            self._log.append_log(f"ERR: Shortcut failed — {e}")
+            if hasattr(e, "args") and e.args:
+                if len(e.args) >= 3 and isinstance(e.args[2], tuple) and len(e.args[2]) >= 3 and e.args[2][2]:
+                    err_msg = str(e.args[2][2])
+                elif e.args[0]:
+                    err_msg = str(e.args[0])
+                else:
+                    err_msg = str(e)
+            else:
+                err_msg = str(e)
+            self._log.append_log(f"ERR: Shortcut failed — {err_msg}")
+
+        # Always record in logs/agent_actions.jsonl
+        try:
+            from core.logger import ActionLogger
+            ActionLogger.log_event(
+                tool="desktop_shortcut",
+                action="create",
+                result={"path": created_path} if success else None,
+                error=None if success else err_msg,
+                verified=success,
+            )
+        except Exception:
+            pass
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
@@ -4651,6 +4967,15 @@ class MainWindow(QMainWindow):
         self._autostart_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._autostart_btn.clicked.connect(self._toggle_autostart)
         lay.addWidget(self._autostart_btn)
+
+        api_btn = QPushButton("  Gemini API Key")
+        api_btn.setFixedHeight(30)
+        api_btn.setFont(_app_font(9))
+        api_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        api_btn.setIcon(icon("lock"))
+        api_btn.setStyleSheet(_BTN_STYLE_DIM)
+        api_btn.clicked.connect(self._open_api_key_dialog)
+        lay.addWidget(api_btn)
 
         cust_btn = QPushButton("  Customise Assistant")
         cust_btn.setFixedHeight(30)
@@ -5303,6 +5628,12 @@ class MainWindow(QMainWindow):
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
     def notify_phone_connected(self) -> None:
+        if threading.current_thread() is not threading.main_thread():
+            if hasattr(self, "_phone_connected_sig"):
+                self._phone_connected_sig.emit()
+            else:
+                QTimer.singleShot(0, self.notify_phone_connected)
+            return
         if self._remote_overlay and self._remote_overlay.isVisible():
             self._remote_overlay.mark_connected()
 
@@ -5402,12 +5733,15 @@ class MainWindow(QMainWindow):
                 if currently_on:
                     desk.unlink(missing_ok=True)
                 else:
+                    png_path = get_app_icon_png_path()
+                    icon_line = f"Icon={png_path}\n" if png_path and png_path.exists() else ""
                     desk.write_text(
                         "[Desktop Entry]\n"
                         f"Name={self._assistant_name}\n"
                         f"Exec={sys.executable} {script}\n"
                         "Type=Application\nTerminal=false\n"
                         "X-GNOME-Autostart-enabled=true\n"
+                        + icon_line
                     )
             enabled = not currently_on
             self._update_autostart_btn(enabled)
@@ -5778,6 +6112,7 @@ class MainWindow(QMainWindow):
         )
         ov.on_preview = self._preview_ui_color
         ov.saved.connect(self._apply_name_update)
+        ov.edit_key_requested.connect(self._open_api_key_dialog)
         ov.show()
         self._customize_overlay = ov
 
@@ -6017,6 +6352,7 @@ class MainWindow(QMainWindow):
                 "SPEAKING":  "Speaking…",
                 "MUTED":     "Microphone muted",
                 "SLEEPING":  f'Sleeping — say "{self._assistant_name.capitalize()}" to wake',
+                "SHUTTING_DOWN": "Shutting down...",
             }.get(state, f'{state.capitalize()} — say "{self._assistant_name.capitalize()}" to wake')
             self._status_pill.setText(f"●  {txt}")
         if hasattr(self, "_floating_island") and self._floating_island:
@@ -6040,23 +6376,53 @@ class MainWindow(QMainWindow):
         except Exception:
             return False
 
-    def _show_setup(self):
-        ov = SetupOverlay(self.centralWidget())
+    def _open_api_key_dialog(self):
+        if hasattr(self, '_quick_drawer') and self._quick_drawer.isVisible():
+            self._quick_drawer.hide()
+            if hasattr(self, '_drawer_btn'):
+                self._drawer_btn.setChecked(False)
+        cfg = _read_full_config()
+        current_key = cfg.get("gemini_api_key", "") or ""
+        self._show_setup(current_key=current_key, can_cancel=True)
+
+    def _show_setup(self, current_key: str = "", can_cancel: bool = False):
+        if hasattr(self, "_overlay") and self._overlay:
+            try:
+                self._overlay.hide()
+            except Exception:
+                pass
+            self._overlay = None
+        if not current_key:
+            cfg = _read_full_config()
+            current_key = cfg.get("gemini_api_key", "") or ""
+        ov = SetupOverlay(self.centralWidget(), current_key=current_key, can_cancel=can_cancel)
         cw = self.centralWidget()
-        ow, oh = 460, 390
+        ow, oh = getattr(SetupOverlay, "_OW", 480), getattr(SetupOverlay, "_OH", 410)
         ov.setGeometry(
             (cw.width()  - ow) // 2,
             (cw.height() - oh) // 2,
             ow, oh,
         )
         ov.done.connect(self._on_setup_done)
+        ov.cancelled.connect(self._on_setup_cancelled)
         ov.show()
+        ov.raise_()
         self._overlay = ov
+
+    def _on_setup_cancelled(self):
+        if self._overlay:
+            self._overlay.hide()
+            self._overlay = None
 
     def _on_setup_done(self, key: str, os_name: str):
         os.makedirs(CONFIG_DIR, exist_ok=True)
+        cfg = _read_full_config()
+        old_key = (cfg.get("gemini_api_key", "") or "").strip()
+        new_key = key.strip()
+        cfg["gemini_api_key"] = new_key
+        cfg["os_system"] = os_name
         API_FILE.write_text(
-            json.dumps({"gemini_api_key": key, "os_system": os_name}, indent=4),
+            json.dumps(cfg, indent=4),
             encoding="utf-8",
         )
         self._ready = True
@@ -6064,8 +6430,17 @@ class MainWindow(QMainWindow):
             self._overlay.hide()
             self._overlay = None
         self._apply_state("LISTENING")
-        self._assistant_name = _read_full_config().get("assistant_name", "AGENT") or "AGENT"
-        self._log.append_log(f"SYS: Initialised. OS={os_name.upper()}. {self._assistant_name} online.")
+        self._assistant_name = cfg.get("assistant_name", "AGENT") or "AGENT"
+        self._log.append_log(f"SYS: Gemini API key saved. {self._assistant_name} online.")
+        if old_key != new_key and callable(getattr(self, "on_api_key_change", None)):
+            self.on_api_key_change()
+
+    def closeEvent(self, event):
+        if callable(getattr(self, "on_close_requested", None)):
+            event.ignore()
+            self.on_close_requested()
+        else:
+            super().closeEvent(event)
 
 
 class _RootShim:
@@ -6081,6 +6456,7 @@ class AgentUI:
     def __init__(self, face_path: str, size=None):
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._app.setStyle("Fusion")
+        self._app.setWindowIcon(get_app_icon())
         self._win = MainWindow(face_path)
         self.root = _RootShim(self._app)
         # Show MainWindow and Floating Island on startup
@@ -6096,7 +6472,10 @@ class AgentUI:
     @muted.setter
     def muted(self, v: bool):
         if v != self._win._muted:
-            self._win._toggle_mute()
+            if threading.current_thread() is not threading.main_thread():
+                QTimer.singleShot(0, self._win._toggle_mute)
+            else:
+                self._win._toggle_mute()
 
     @property
     def current_file(self) -> str | None:
@@ -6125,6 +6504,15 @@ class AgentUI:
     @on_text_command.setter
     def on_text_command(self, cb):
         self._win.on_text_command = cb
+
+    @property
+    def on_close_requested(self):
+        return getattr(self._win, "on_close_requested", None)
+
+    @on_close_requested.setter
+    def on_close_requested(self, cb):
+        if hasattr(self, "_win") and self._win:
+            self._win.on_close_requested = cb
 
     @property
     def on_remote_clicked(self):
@@ -6157,6 +6545,14 @@ class AgentUI:
     @on_audio_device_change.setter
     def on_audio_device_change(self, cb):
         self._win.on_audio_device_change = cb
+
+    @property
+    def on_api_key_change(self):
+        return getattr(self._win, "on_api_key_change", None)
+
+    @on_api_key_change.setter
+    def on_api_key_change(self, cb):
+        self._win.on_api_key_change = cb
 
     def show_confirm(self, title: str, detail: str) -> None:
         """Thread-safe: raise the irreversible-action gate. Called from action
@@ -6257,15 +6653,33 @@ class AgentUI:
         except Exception:
             pass
 
+    def reset_visemes(self) -> None:
+        """Thread-safe: discard any remaining viseme schedule."""
+        try:
+            self._win.hud.reset_visemes()
+        except Exception:
+            pass
+
     def notify_phone_connected(self) -> None:
-        self._win.notify_phone_connected()
+        if self._win:
+            if hasattr(self._win, "_phone_connected_sig"):
+                self._win._phone_connected_sig.emit()
+            else:
+                QTimer.singleShot(0, self._win.notify_phone_connected)
 
     def set_state(self, state: str):
         self._win._state_sig.emit(state)
 
     def set_phone_mic_active(self, active: bool):
         if self._win:
-            self._win.set_phone_mic_active(active)
+            if hasattr(self._win, "_phone_mic_sig"):
+                self._win._phone_mic_sig.emit(bool(active))
+            else:
+                self._win.set_phone_mic_active(active)
+
+    def _hide_confirm_banner(self) -> None:
+        """Thread-safe: dismiss confirmation banner."""
+        self.hide_confirm()
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)

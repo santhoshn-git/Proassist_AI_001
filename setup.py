@@ -56,13 +56,20 @@ def _check_python() -> None:
 
 
 def _check_assets() -> None:
-    """The avatar's face is a shipped file; a truncated clone should say so."""
+    """The avatar's face and ProAssist AI icons are shipped files; verify presence."""
     face = HERE / "core" / "face_model.obj"
     if not face.exists() or face.stat().st_size < 4096:
         print(
             "\n⚠️  core/face_model.obj is missing or truncated — the avatar will "
             "fall back to the plain glowing core.\n"
             "    Re-clone the repository, or fetch that one file again."
+        )
+    icon_ico = HERE / "assets" / "proassist_icon.ico"
+    icon_png = HERE / "assets" / "proassist_icon.png"
+    if not icon_ico.exists() and not icon_png.exists():
+        print(
+            "\n⚠️  assets/proassist_icon.ico and assets/proassist_icon.png are missing.\n"
+            "    Application windows will fall back to default system icons."
         )
 
 
