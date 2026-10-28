@@ -27,7 +27,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   // ── 2. Dynamic GitHub Repo & Download Router ──────────────────────────────
-  const defaultRepo = "your-username/ProAssist_AI";
+  const defaultRepo = "santhoshn-git/Proassist_AI_001";
   const repoInput = document.getElementById("github-repo-input");
   const updateBtn = document.getElementById("update-repo-btn");
   const downloadBtns = document.querySelectorAll(".btn-download-target");
