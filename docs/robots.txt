@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://santhoshn-git.github.io/Proassist_AI_001/sitemap.xml
