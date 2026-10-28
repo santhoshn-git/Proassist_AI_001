@@ -405,21 +405,5 @@ All three are listed in `.gitignore`, so a fork or a pull request cannot leak th
 
 Your voice is streamed to Google's Gemini Live API while a session is open; that is the one thing that leaves your computer, and it stops when you mute or close the app.
 
----
-
-## ⚠️ License
-
-Personal and non-commercial use only.
-Licensed under **[Creative Commons BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/)**.
-
----
-
-## 👤 Connect with the Creator
-
-Engineered by a developer building a real-world AGENT-style assistant.
-⭐ **Star the repository to support the journey to Mark 100.**
-
-| Platform | Link |
-| --- | --- |
-| YouTube | [@FatihMakes](https://www.youtube.com/@FatihMakes) |
+[@FatihMakes](https://www.youtube.com/@FatihMakes) |
 | Instagram | [@fatihmakes](https://www.instagram.com/fatihmakes) |
