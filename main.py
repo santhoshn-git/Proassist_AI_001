@@ -680,6 +680,7 @@ class AgentLive:
         self._interrupted_safety_task = None # Auto-clear task after INTERRUPT_IDLE_TIMEOUT (3.0s) silence
         self._phone_reply_buffer   = []      # List of (chunk_bytes, chunk_sec) for current reply, capped at 60s (Task 1 Patch 3)
         self._phone_reply_dur      = 0.0     # Total duration in self._phone_reply_buffer
+        self._last_remote_command_time = 0.0 # Monotonic time of last remote control command or phone interaction
         # Transcript-driven mouth shapes for the avatar. Fed from the receive
         # loop as words arrive, drained by the playback loop against the audio.
         self._visemes              = VisemeStream()
@@ -2564,8 +2565,10 @@ class AgentLive:
                 if self._dashboard:
                     routing = self._dashboard.get_audio_routing()
 
+                has_playback = (self._dashboard is not None) and self._dashboard.has_playback_clients()
                 phone_live = self._phone_active or (self._dashboard is not None and self._dashboard.is_phone_mic_active())
-                route_phone = phone_live and (routing in ("phone", "both")) and (self._dashboard is not None) and self._dashboard.has_playback_clients()
+                recent_remote = (time.monotonic() - getattr(self, "_last_remote_command_time", 0.0)) < 30.0
+                route_phone = has_playback and ((routing in ("phone", "both")) or phone_live or recent_remote)
 
                 # Check phone playback health (Task 1 Item 1: > 2s no heartbeat -> fallback)
                 if route_phone and not self._dashboard.is_playback_healthy(max_idle=2.0):
@@ -2642,7 +2645,10 @@ class AgentLive:
                             except Exception:
                                 break
 
-                need_laptop = (routing == "both") or (not route_phone) or (not phone_ok)
+                if route_phone and phone_ok:
+                    need_laptop = (routing == "both")
+                else:
+                    need_laptop = True
                 if need_laptop:
                     try:
                         await asyncio.to_thread(stream.write, bytes(batch))
@@ -2987,6 +2993,7 @@ class AgentLive:
                     if self._dashboard:
                         self._dashboard.broadcast_mic_state_sync()
                 continue
+            self._last_remote_command_time = time.monotonic()
             if not self._phone_active:
                 self._phone_active = True   # phone is streaming — silence PC mic
                 if hasattr(self.ui, "set_phone_mic_active"):
@@ -3084,6 +3091,7 @@ class AgentLive:
                 )
                 if not text:
                     continue
+                self._last_remote_command_time = time.monotonic()
                 self._clear_interrupted()
                 # Wait up to 8s for session to become ready after a wake
                 for _ in range(80):

@@ -2411,6 +2411,9 @@
       if (_audioRouting) {
         try { ws.send(JSON.stringify({ type: 'audio_routing', routing: _audioRouting, pause_mic_on_reply: _pauseMicWhileReplying })); } catch(_) {}
       }
+      if (_audioRouting !== 'laptop') {
+        _startPlaybackStream();
+      }
     };
     ws.onclose   = () => sys('Connection lost — refresh to reconnect.');
     ws.onerror   = () => sys('Connection error.');
@@ -2788,6 +2791,11 @@
         _audioRouting = r;
         localStorage.setItem('jarvis_audio_routing', r);
         _updateRoutingUI();
+        if (r === 'laptop') {
+          _stopPlaybackStream();
+        } else {
+          _startPlaybackStream();
+        }
       }
       if (pauseMic !== undefined) {
         _pauseMicWhileReplying = !!pauseMic;
@@ -2802,6 +2810,11 @@
       _audioRouting = route;
       localStorage.setItem('jarvis_audio_routing', route);
       _updateRoutingUI();
+      if (route === 'laptop') {
+        _stopPlaybackStream();
+      } else {
+        _startPlaybackStream();
+      }
       if (ws && ws.readyState === 1) {
         try { ws.send(JSON.stringify({ type: 'audio_routing', routing: route, pause_mic_on_reply: _pauseMicWhileReplying })); } catch(_) {}
       }
@@ -2874,6 +2887,9 @@
         if (_playbackAudioCtx && _playbackAudioCtx.state === 'suspended') {
           try { await _playbackAudioCtx.resume(); } catch (_) {}
         }
+        if (_audioRouting !== 'laptop' && (!_playbackWs || _playbackWs.readyState > 1)) {
+          _startPlaybackStream();
+        }
         if (_audioCtx && _audioCtx.state === 'suspended') {
           try { await _audioCtx.resume(); } catch (_) {}
         }
@@ -2898,6 +2914,13 @@
           } catch (_) {}
         }
       }
+    });
+
+    // Unlock Web Audio on any touch or click gesture
+    ['click', 'touchstart', 'touchend', 'pointerdown', 'keydown'].forEach(evt => {
+      window.addEventListener(evt, () => {
+        _ensurePlaybackCtx();
+      }, { passive: true });
     });
 
     // ── Downstream Phone Playback (Web Audio API) ─────────────────────────
@@ -2932,6 +2955,7 @@
         _playbackWs.binaryType = 'arraybuffer';
         _playbackWs.onopen = () => {
           _playbackRetryCount = 0;
+          _playbackRetry1008Count = 0;
           if (_playbackHbTimer) clearInterval(_playbackHbTimer);
           _playbackHbTimer = setInterval(() => {
             if (_playbackWs && _playbackWs.readyState === 1) {
@@ -2971,11 +2995,11 @@
 
           // Close code 1008: retry once after 4s, then stop
           if (code === 1008) {
-            if (_voiceDesired && _playbackRetry1008Count === 0) {
+            if (_audioRouting !== 'laptop' && _playbackRetry1008Count === 0) {
               _playbackRetry1008Count = 1;
               if (_playbackRetryTimer) clearTimeout(_playbackRetryTimer);
               _playbackRetryTimer = setTimeout(async () => {
-                if (!_voiceDesired) return;
+                if (_audioRouting === 'laptop') return;
                 await _refreshAuthTokenIfNeeded();
                 _startPlaybackStream();
               }, 4000);
@@ -2984,12 +3008,12 @@
           }
 
           // Close code 4008 (rate limited) & unexpected network drops: normal backoff
-          if (_voiceDesired && _playbackRetryCount < 5) {
+          if (_audioRouting !== 'laptop' && _playbackRetryCount < 10) {
             _playbackRetryCount++;
             const delay = Math.min(_playbackRetryCount, 3) * 1000;
             if (_playbackRetryTimer) clearTimeout(_playbackRetryTimer);
             _playbackRetryTimer = setTimeout(async () => {
-              if (!_voiceDesired) return;
+              if (_audioRouting === 'laptop') return;
               await _refreshAuthTokenIfNeeded();
               _startPlaybackStream();
             }, delay);
@@ -3019,6 +3043,9 @@
     function _handlePlaybackChunk(ab) {
       const ctx = _ensurePlaybackCtx();
       if (!ctx) return;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
       const pcm16 = new Int16Array(ab);
       if (pcm16.length === 0) return;
 
@@ -3466,7 +3493,9 @@
 
     function _stopVoice(preserveError = false) {
       _releaseWakeLock();
-      _stopPlaybackStream();
+      if (_audioRouting === 'laptop') {
+        _stopPlaybackStream();
+      }
       if (_voiceRetryTimer) { clearTimeout(_voiceRetryTimer); _voiceRetryTimer = null; }
       if (_audioNd)  { try { _audioNd.disconnect(); }  catch (_) {}; _audioNd  = null; }
       if (_audioCtx) { try { _audioCtx.close(); }      catch (_) {}; _audioCtx = null; }
